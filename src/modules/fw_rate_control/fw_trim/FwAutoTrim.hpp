@@ -100,7 +100,7 @@ private:
 
 	matrix::Vector3f _trim_validated{};
 
-	perf_counter_t _cycle_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle time")};
+	perf_counter_t _cycle_perf{perf_alloc(PC_ELAPSED, "[AutoTrim] cycle time")};
 
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::FW_AIRSPD_MIN>) _param_fw_airspd_min,

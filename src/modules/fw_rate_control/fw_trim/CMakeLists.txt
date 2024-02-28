@@ -30,9 +30,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 #
 ############################################################################
-px4_add_library(FwAutoTrim
+px4_add_library(FwTrim
+	FwTrim.cpp
 	FwAutoTrim.cpp
 )
 
-# target_link_libraries(FwAutoTrim)
-target_include_directories(FwAutoTrim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# target_link_libraries(FwTrim)
+target_include_directories(FwTrim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

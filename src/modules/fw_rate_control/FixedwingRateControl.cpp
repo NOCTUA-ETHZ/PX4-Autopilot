@@ -37,7 +37,6 @@ using namespace time_literals;
 using namespace matrix;
 
 using math::constrain;
-using math::interpolate;
 using math::radians;
 
 FixedwingRateControl::FixedwingRateControl(bool vtol) :
@@ -54,7 +53,7 @@ FixedwingRateControl::FixedwingRateControl(bool vtol) :
 	parameters_update();
 
 	_rate_ctrl_status_pub.advertise();
-	_auto_trim_slew.setSlewRate(Vector3f(0.01f, 0.01f, 0.01f));
+	_trim_slew.setSlewRate(Vector3f(0.01f, 0.01f, 0.01f));
 }
 
 FixedwingRateControl::~FixedwingRateControl()
@@ -128,13 +127,14 @@ FixedwingRateControl::vehicle_manual_poll()
 
 			} else {
 				// Manual/direct control, filled in FW-frame. Note that setpoints will get transformed to body frame prior publishing.
+				const Vector3f trim = _trim_slew.getState();
 
 				_vehicle_torque_setpoint.xyz[0] = math::constrain(_manual_control_setpoint.roll * _param_fw_man_r_sc.get() +
-								  _param_trim_roll.get(), -1.f, 1.f);
+								  trim(0), -1.f, 1.f);
 				_vehicle_torque_setpoint.xyz[1] = math::constrain(-_manual_control_setpoint.pitch * _param_fw_man_p_sc.get() +
-								  _param_trim_pitch.get(), -1.f, 1.f);
+								  trim(1), -1.f, 1.f);
 				_vehicle_torque_setpoint.xyz[2] = math::constrain(_manual_control_setpoint.yaw * _param_fw_man_y_sc.get() +
-								  _param_trim_yaw.get(), -1.f, 1.f);
+								  trim(2), -1.f, 1.f);
 
 				_vehicle_thrust_setpoint.xyz[0] = math::constrain((_manual_control_setpoint.throttle + 1.f) * .5f, 0.f, 1.f);
 			}
@@ -322,30 +322,8 @@ void FixedwingRateControl::Run()
 				}
 			}
 
-			/* bi-linear interpolation over airspeed for actuator trim scheduling */
-			Vector3f trim(_param_trim_roll.get(), _param_trim_pitch.get(), _param_trim_yaw.get());
-
-			if (airspeed < _param_fw_airspd_trim.get()) {
-				trim(0) += interpolate(airspeed, _param_fw_airspd_min.get(), _param_fw_airspd_trim.get(),
-						       _param_fw_dtrim_r_vmin.get(),
-						       0.0f);
-				trim(1) += interpolate(airspeed, _param_fw_airspd_min.get(), _param_fw_airspd_trim.get(),
-						       _param_fw_dtrim_p_vmin.get(),
-						       0.0f);
-				trim(2) += interpolate(airspeed, _param_fw_airspd_min.get(), _param_fw_airspd_trim.get(),
-						       _param_fw_dtrim_y_vmin.get(),
-						       0.0f);
-
-			} else {
-				trim(0) += interpolate(airspeed, _param_fw_airspd_trim.get(), _param_fw_airspd_max.get(), 0.0f,
-						       _param_fw_dtrim_r_vmax.get());
-				trim(1) += interpolate(airspeed, _param_fw_airspd_trim.get(), _param_fw_airspd_max.get(), 0.0f,
-						       _param_fw_dtrim_p_vmax.get());
-				trim(2) += interpolate(airspeed, _param_fw_airspd_trim.get(), _param_fw_airspd_max.get(), 0.0f,
-						       _param_fw_dtrim_y_vmax.get());
-			}
-
-			trim += _auto_trim_slew.update(_auto_trim.getTrim(), dt);
+			_trim.setAirspeed(airspeed);
+			_trim_slew.update(_trim.getTrim(), dt);
 
 			if (_vcontrol_mode.flag_control_rates_enabled) {
 				_rates_sp_sub.update(&_rates_sp);
@@ -373,12 +351,11 @@ void FixedwingRateControl::Run()
 				}
 
 				if (control_u.isAllFinite()) {
-					matrix::constrain(control_u + trim, -1.f, 1.f).copyTo(_vehicle_torque_setpoint.xyz);
-					_auto_trim.update(control_u + _auto_trim_slew.getState(), dt);
+					matrix::constrain(control_u + _trim_slew.getState(), -1.f, 1.f).copyTo(_vehicle_torque_setpoint.xyz);
 
 				} else {
 					_rate_control.resetIntegral();
-					trim.copyTo(_vehicle_torque_setpoint.xyz);
+					_trim_slew.getState().copyTo(_vehicle_torque_setpoint.xyz);
 				}
 
 				/* throttle passed through if it is finite */
@@ -409,7 +386,7 @@ void FixedwingRateControl::Run()
 		} else {
 			// full manual
 			_rate_control.resetIntegral();
-			_auto_trim.reset();
+			_trim.reset();
 		}
 
 		// Add feed-forward from roll control output to yaw control output
@@ -437,6 +414,8 @@ void FixedwingRateControl::Run()
 				_vehicle_torque_setpoint.timestamp_sample = angular_velocity.timestamp_sample;
 				_vehicle_torque_setpoint_pub.publish(_vehicle_torque_setpoint);
 			}
+
+			_trim.updateAutoTrim(Vector3f(_vehicle_torque_setpoint.xyz), dt);
 		}
 
 		updateActuatorControlsStatus(dt);
@@ -571,6 +550,12 @@ fw_rate_control is the fixed-wing rate controller.
 	PRINT_MODULE_USAGE_ARG("vtol", "VTOL mode", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 
+	return 0;
+}
+
+int FixedwingRateControl::print_status()
+{
+	_trim.print_status();
 	return 0;
 }
 
