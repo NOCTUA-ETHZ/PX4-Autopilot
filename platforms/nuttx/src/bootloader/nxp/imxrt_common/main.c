@@ -395,22 +395,23 @@ flash_func_sector_size(unsigned sector)
 	return 0;
 }
 
-int flash_func_is_sector_blank(unsigned sector)
+/* imxRT uses Flash lib, not up_progmem so let's stub it here */
+up_progmem_ispageerased(unsigned sector)
 {
 	const uint32_t bytes_per_sector =  flash_func_sector_size(sector);
 	uint32_t *address = (uint32_t *)(IMXRT_FLEXSPI1_CIPHER_BASE + (sector * bytes_per_sector));
 	const uint32_t uint32_per_sector =  bytes_per_sector / sizeof(*address);
 
-	bool blank = true;
+	int blank = 0; /* Assume it is Bank */
 
 	for (uint32_t i = 0; i < uint32_per_sector; i++) {
 		if (address[i] != 0xffffffff) {
-			blank = false;
+			blank = -1;  /* It is not blank */
 			break;
 		}
 	}
 
-	return !blank;
+	return blank;
 }
 
 /*!
