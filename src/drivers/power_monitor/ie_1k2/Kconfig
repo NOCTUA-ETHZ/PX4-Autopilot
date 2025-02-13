@@ -1,0 +1,5 @@
+menuconfig DRIVERS_POWER_MONITOR_IE_1k2
+	bool "IE_1k2"
+	default y
+	---help---
+		Enable support for ina238
