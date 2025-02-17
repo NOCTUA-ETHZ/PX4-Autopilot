@@ -33,43 +33,41 @@ IE_1K2::IE_1K2() :
 
 IE_1K2::~IE_1K2()
 {
-	if (_uart_fd >= 0) {
-		::close(_uart_fd);
-	}
+	// if (_uart_fd >= 0) {
+	// 	::close(_uart_fd);
+	// }
 	perf_free(_sample_perf);
 	perf_free(_comms_errors);
 }
 
-int IE_1K2::init()
+bool IE_1K2::init()
 {
-	if (_initialized) {
-		PX4_WARN("IE_1K2 already initialized");
-		return PX4_OK;
-	}
+    if (_initialized) {
+        PX4_WARN("IE_1K2 already initialized");
+        return true;
+    }
 
-	_uart_fd = ::open(_port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    _uart_fd = ::open(_port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (_uart_fd < 0) {
+        PX4_ERR("Failed to open port %s", _port);
+        return false;
+    }
 
-	if (_uart_fd < 0) {
-		PX4_ERR("Failed to open port %s", _port);
-		return PX4_ERROR;
-	}
+    if (!configureUart()) {
+        PX4_ERR("configureUart() failed");
+        ::close(_uart_fd);
+        _uart_fd = -1;
+        return false;
+    }
 
-	if (!configureUart()) {
-		PX4_ERR("configureUart() failed");
-		::close(_uart_fd);
-		_uart_fd = -1;
-		return PX4_ERROR;
-	}
+    ScheduleNow();
+    ScheduleOnInterval(10, 0);
+    _initialized = true;
 
-	// Schedule periodic execution every 100 ms
-	ScheduleOnInterval(100000);
-	_initialized = true;
-
-	// --- Debug print here to confirm init done and scheduling started ---
-	PX4_INFO("Hello from IE_1K2 init, build 2025-02-18! Driver init complete1.");
-
-	return PX4_OK;
+    PX4_INFO("Hello from IE_1K2 init, build 2025-02-18! Driver init complete3.");
+    return true;
 }
+
 
 bool IE_1K2::configureUart()
 {
@@ -100,12 +98,13 @@ bool IE_1K2::configureUart()
 		PX4_ERR("Failed to set UART config on %s", _port);
 		return false;
 	}
-
+	PX4_INFO_RAW("Success with UART: %s\n", _port);
 	return true;
 }
 
 void IE_1K2::processData(const uint8_t *buffer, size_t length)
 {
+	PX4_INFO("Processing data");
 	char local_buf[256 + 1] = {};
 
 	if (length > 256) {
@@ -153,8 +152,17 @@ void IE_1K2::processData(const uint8_t *buffer, size_t length)
 
 void IE_1K2::Run()
 {
+	if (should_exit()) {
+		ScheduleClear();
+		exit_and_cleanup();
+		return;
+	}
+
+	perf_begin(_loop_perf);
+	perf_count(_loop_interval_perf);
 	// --- Debug print to confirm Run() is firing ---
-	PX4_ERR("IE_1K2::Run() called. Reading from UART...");
+	PX4_INFO("IE_1K2::Run() called. Reading from UART...");
+	PX4_INFO_RAW("IE_1K2::Run() called. Reading from UART...\n");
 
 	if (_uart_fd < 0) {
 		PX4_WARN("UART not open in Run()");
@@ -165,7 +173,7 @@ void IE_1K2::Run()
 		NONE,
 		ANGLE,
 		BRACKET
-	} parse_mode = ParseMode::NONE;
+	} parse_mode = ParseMode::ANGLE;
 
 	static uint8_t angle_buffer[RECEIVE_BUFFER_SIZE];
 	static size_t angle_length = 0;
@@ -174,6 +182,9 @@ void IE_1K2::Run()
 	static size_t bracket_length = 0;
 
 	uint8_t byte;
+	uint8_t read_count = 0;
+	while (::read(_uart_fd, &byte, 1) > 0 && read_count < RECEIVE_BUFFER_SIZE) {
+		read_count++;
 	while (::read(_uart_fd, &byte, 1) > 0) {
 
 		switch (parse_mode) {
@@ -234,9 +245,11 @@ void IE_1K2::Run()
 	}
 
 	// If no data received for 1 second, print a warning
-	if (hrt_elapsed_time(&_last_read_time) > 1000000) {
-		PX4_WARN("No data received for over 1 second");
+	if (hrt_elapsed_time(&_last_read_time) > 100000) {
+		PX4_WARN("No data received for over 10");
 	}
+
+	perf_end(_loop_perf);
 }
 
 int IE_1K2::print_status()
@@ -250,28 +263,52 @@ int IE_1K2::print_status()
 		PX4_INFO("rx_errors: %" PRIu32 ", parse_errors: %" PRIu32,
 		         _rx_errors, _parse_errors);
 	}
+	perf_print_counter(_loop_perf);
+	perf_print_counter(_loop_interval_perf);
 	return 0;
 }
+
+int IE_1K2::custom_command(int argc, char *argv[])
+{
+    if (argc > 1 && strcmp(argv[1], "run") == 0) {
+        PX4_INFO("Manual run command received, invoking Run() method");
+        IE_1K2 *inst = _object.load();
+        if (inst) {
+            inst->Run();
+            return PX4_OK;
+        } else {
+            PX4_ERR("Module instance not running");
+            return PX4_ERROR;
+        }
+    }
+    return print_usage("unknown command");
+}
+
+
+
 
 int IE_1K2::task_spawn(int argc, char *argv[])
 {
 	IE_1K2 *instance = new IE_1K2();
-	if (instance == nullptr) {
+	if (!instance) {
 		PX4_ERR("Allocation failed");
 		return PX4_ERROR;
 	}
+	else {
+		_object.store(instance);
+		_task_id = task_id_is_work_queue;
 
-	_object.store(instance);
-
-	if (instance->init() != PX4_OK) {
-		PX4_ERR("Driver init failed");
-		delete instance;
-		_object.store(nullptr);
-		return PX4_ERROR;
+		if (instance->init()) {
+			PX4_INFO("Driver IO");
+			return PX4_OK;
+		}
 	}
 
-	_task_id = task_id_is_work_queue;
-	return PX4_OK;
+	delete instance;
+	_object.store(nullptr);
+	_task_id = -1;
+
+	return PX4_ERROR;
 }
 
 extern "C" __EXPORT int ie_1k2_main(int argc, char *argv[])
