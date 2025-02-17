@@ -1,5 +1,19 @@
-menuconfig DRIVERS_POWER_MONITOR_IE_1k2
-	bool "ie_1k2"
-	default y
-	---help---
-		Enable support for ie_1k2
+menuconfig DRIVERS_POWER_MONITOR_IE_1K2
+    bool "ie_1k2"
+    default y
+    ---help---
+        Enable support for IE_1K2 fuel cell
+
+if DRIVERS_POWER_MONITOR_IE_1K2
+    config IE_1K2_DEFAULT_PORT
+        string "Default serial port"
+        default "/dev/ttyS1"
+        ---help---
+            Default serial port for the IE_1K2 fuel cell
+
+    config IE_1K2_DEFAULT_BAUDRATE
+        int "Default baudrate"
+        default 9600
+        ---help---
+            Default baudrate for the IE_1K2 fuel cell
+endif

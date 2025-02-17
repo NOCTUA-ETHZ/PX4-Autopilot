@@ -1,318 +1,401 @@
 /****************************************************************************
  *
- *   Copyright (c) 2020 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2024 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *  (see header for full license text)
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  *
  ****************************************************************************/
 
 #include "ie_1k2.hpp"
-#include <px4_platform_common/log.h>
-#include <px4_platform_common/defines.h>
+
 #include <fcntl.h>
-#include <unistd.h>
 #include <termios.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <inttypes.h>
+#include <fcntl.h>
 
-// Define your buffer size
-static constexpr size_t RECEIVE_BUFFER_SIZE = 256;
 
-IE_1K2::IE_1K2() :
-	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default)
+// Protocol constants
+static constexpr uint8_t START_FRAME_CHAR = '<';
+static constexpr uint8_t END_FRAME_CHAR = '>';
+static constexpr size_t MAX_FRAME_SIZE = 256;
+
+IE_1K2::IE_1K2(const char *port, uint8_t rotation) :
+    ScheduledWorkItem(DRIVER_NAME, px4::serial_port_to_wq(port)),
+    _fuel_cell_pub(nullptr)
 {
-	snprintf(_port, sizeof(_port), "/dev/ttyS1");
+    PX4_INFO("IE_1K2 constructor - start");
 
-	// Optional constructor debug:
-	PX4_DEBUG("IE_1K2 constructor: Using UART port: %s", _port);
+    // Store the port name
+    strncpy(_port, port, sizeof(_port) - 1);
+    _port[sizeof(_port) - 1] = '\0';
+    PX4_INFO("Port stored: %s", _port);
+
+    // Initialize performance counters
+_sample_perf = perf_alloc(PC_ELAPSED, DRIVER_NAME ": read");
+_comms_errors = perf_alloc(PC_COUNT, DRIVER_NAME ": comm errors");
+_parse_errors = perf_alloc(PC_COUNT, DRIVER_NAME ": parse errors");
+
+
+    PX4_INFO("IE_1K2 constructor - complete");
 }
 
 IE_1K2::~IE_1K2()
 {
-	// if (_uart_fd >= 0) {
-	// 	::close(_uart_fd);
-	// }
-	perf_free(_sample_perf);
-	perf_free(_comms_errors);
+    stop();
+
+    perf_free(_sample_perf);
+    perf_free(_comms_errors);
+    perf_free(_parse_errors);
 }
 
-bool IE_1K2::init()
+int IE_1K2::init()
 {
-    if (_initialized) {
-        PX4_WARN("IE_1K2 already initialized");
-        return true;
+    PX4_INFO("IE_1K2::init() - start");
+
+    // Initialize publisher if not already done
+    if (!_fuel_cell_pub.advertised()) {
+        PX4_INFO("Creating publisher...");
+        if (!_fuel_cell_pub.advertised()) {
+            PX4_ERR("Failed to create publisher");
+            return PX4_ERROR;
+        }
     }
 
-    _uart_fd = ::open(_port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    PX4_INFO("Starting driver...");
+    start();
+
+    PX4_INFO("IE_1K2::init() - complete");
+    return PX4_OK;
+}
+
+int IE_1K2::open_serial_port(const speed_t speed)
+{
+	PX4_INFO("IE_1K2::open_serial_port()");
+    // File descriptor already initialized?
+    if (_uart_fd > 0) {
+        return PX4_OK;
+    }
+
+    // Configure port flags for read/write, non-controlling, non-blocking
+    int flags = (O_RDWR | O_NOCTTY | O_NONBLOCK);
+
+    // Open the serial port
+    _uart_fd = ::open(_port, flags);
+
     if (_uart_fd < 0) {
         PX4_ERR("Failed to open port %s", _port);
-        return false;
+        return PX4_ERROR;
     }
 
-    if (!configureUart()) {
-        PX4_ERR("configureUart() failed");
+    // Configure UART
+    struct termios uart_config {};
+
+    // Get current configuration
+    if (tcgetattr(_uart_fd, &uart_config) < 0) {
+        PX4_ERR("Failed to get UART config");
+        ::close(_uart_fd);
+        return PX4_ERROR;
+    }
+
+    // Set baud rate
+    if (cfsetispeed(&uart_config, speed) < 0 || cfsetospeed(&uart_config, speed) < 0) {
+        PX4_ERR("Failed to set UART speed");
+        ::close(_uart_fd);
+        return PX4_ERROR;
+    }
+
+    // Set data bits, stop bits, parity
+    uart_config.c_cflag |= (CLOCAL | CREAD);
+    uart_config.c_cflag &= ~CSIZE;
+    uart_config.c_cflag |= CS8;
+    uart_config.c_cflag &= ~(PARENB | PARODD);
+    uart_config.c_cflag &= ~CSTOPB;
+    uart_config.c_cflag &= ~CRTSCTS;
+
+    // Set raw input/output
+    uart_config.c_iflag &= ~(IGNBRK | BRKINT | ICRNL | INLCR | PARMRK | INPCK | ISTRIP | IXON);
+    uart_config.c_oflag &= ~(OCRNL | ONLCR | ONLRET | ONOCR | OFILL | OPOST);
+    uart_config.c_lflag &= ~(ECHO | ECHONL | ICANON | IEXTEN | ISIG | TOSTOP);
+
+    // Apply configuration
+    if (tcsetattr(_uart_fd, TCSANOW, &uart_config) < 0) {
+        PX4_ERR("Failed to set UART attributes");
+        ::close(_uart_fd);
+        return PX4_ERROR;
+    }
+
+    return PX4_OK;
+}
+
+int IE_1K2::collect()
+{
+	PX4_INFO("IE_1K2::collect()");
+    perf_begin(_sample_perf);
+
+    uint8_t buffer[MAX_FRAME_SIZE];
+    ssize_t bytes_read = ::read(_uart_fd, buffer, sizeof(buffer));
+
+    if (bytes_read < 0) {
+        if (errno != EAGAIN) {
+            PX4_ERR("read error: %d", errno);
+            perf_count(_comms_errors);
+            // Add this line to close and reopen the port on error
+            stop();
+            start();
+        }
+        perf_end(_sample_perf);
+        return bytes_read;
+    }
+
+    // Process received data
+    for (int i = 0; i < bytes_read; i++) {
+        if (process_byte(buffer[i]) == PX4_OK) {
+            // Successfully parsed a complete frame
+            ie_fuel_cell_s report{};
+            if (parse_message(_parse_buffer, _parse_buffer_len, report)) {
+                report.timestamp = hrt_absolute_time();
+                _fuel_cell_pub.publish(report);
+                _last_read_time = report.timestamp;
+            } else {
+                perf_count(_parse_errors);
+            }
+        }
+    }
+
+    perf_end(_sample_perf);
+    return PX4_OK;
+}
+
+int IE_1K2::process_byte(uint8_t byte)
+{
+    switch (_parse_state) {
+        case ParseState::WAITING_START:
+            if (byte == START_FRAME_CHAR) {
+                _parse_state = ParseState::IN_FRAME;
+                _parse_buffer_len = 0;
+                _parse_buffer[_parse_buffer_len++] = byte;
+            }
+            break;
+
+        case ParseState::IN_FRAME:
+            if (byte == END_FRAME_CHAR) {
+                _parse_buffer[_parse_buffer_len++] = byte;
+                _parse_state = ParseState::WAITING_START;
+                return PX4_OK; // Complete frame received
+            } else if (_parse_buffer_len < MAX_FRAME_SIZE - 1) {
+                _parse_buffer[_parse_buffer_len++] = byte;
+            } else {
+                _parse_state = ParseState::WAITING_START;
+                perf_count(_parse_errors);
+            }
+            break;
+    }
+
+    return PX4_ERROR; // Frame not complete yet
+}
+
+bool IE_1K2::parse_message(const uint8_t *buffer, size_t len, ie_fuel_cell_s &report)
+{
+    // Ensure null termination for string operations
+    char msg[MAX_FRAME_SIZE + 1];
+    memcpy(msg, buffer, len);
+    msg[len] = '\0';
+
+    // Parse the message using sscanf
+    int result = sscanf(msg,
+        "<%f,%f,%f,%f,%f,%ld,%f,%ld,%ld,%31[^,],%ld>",
+        &report.tank_pressure,
+        &report.regulated_pressure,
+        &report.battery_voltage,
+        &report.output_power,
+        &report.spm_power_draw,
+        &report.unit_in_fault,
+        &report.battery_output_power,
+        &report.psu_state,
+        &report.main_error_code,
+        report.info_string,
+        &report.checksum
+    );
+
+    return (result == 11);
+}
+
+void IE_1K2::start()
+{
+	PX4_INFO("IE_1K2::start()");
+    // Configure the serial port
+    if (open_serial_port(B9600) != PX4_OK) {
+        PX4_ERR("Failed to open serial port");
+        return;
+    }
+
+    // Schedule the driver to run on an interval
+    ScheduleOnInterval(1000000); // 1000ms interval
+
+    PX4_INFO("IE_1K2 driver started");
+}
+
+void IE_1K2::stop()
+{
+    ScheduleClear();
+
+    if (_uart_fd >= 0) {
         ::close(_uart_fd);
         _uart_fd = -1;
-        return false;
     }
-
-    ScheduleNow();
-    ScheduleOnInterval(10, 0);
-    _initialized = true;
-
-    PX4_INFO("Hello from IE_1K2 init, build 2025-02-18! Driver init complete3.");
-    return true;
-}
-
-
-bool IE_1K2::configureUart()
-{
-	struct termios uart_config{};
-
-	if (tcgetattr(_uart_fd, &uart_config) < 0) {
-		PX4_ERR("Failed to get UART config on %s", _port);
-		return false;
-	}
-
-	// Example: 9600 baud
-	speed_t speed = B9600;
-	cfsetispeed(&uart_config, speed);
-	cfsetospeed(&uart_config, speed);
-
-	uart_config.c_cflag |= (CLOCAL | CREAD);
-	uart_config.c_cflag &= ~CSIZE;
-	uart_config.c_cflag |= CS8;
-	uart_config.c_cflag &= ~PARENB;
-	uart_config.c_cflag &= ~CSTOPB;
-	uart_config.c_cflag &= ~CRTSCTS;
-
-	uart_config.c_iflag &= ~(IGNBRK | BRKINT | ICRNL | INLCR | PARMRK | INPCK | ISTRIP | IXON);
-	uart_config.c_oflag &= ~(OCRNL | ONLCR | ONLRET | ONOCR | OFILL | OPOST);
-	uart_config.c_lflag &= ~(ECHO | ECHONL | ICANON | IEXTEN | ISIG | TOSTOP);
-
-	if (tcsetattr(_uart_fd, TCSANOW, &uart_config) < 0) {
-		PX4_ERR("Failed to set UART config on %s", _port);
-		return false;
-	}
-	PX4_INFO_RAW("Success with UART: %s\n", _port);
-	return true;
-}
-
-void IE_1K2::processData(const uint8_t *buffer, size_t length)
-{
-	PX4_INFO("Processing data");
-	char local_buf[256 + 1] = {};
-
-	if (length > 256) {
-		length = 256;
-	}
-	memcpy(local_buf, buffer, length);
-	local_buf[length] = '\0';
-
-	PX4_INFO("processData(): Received text: '%s'", local_buf);
-
-	ie_fuel_cell_s report{};
-	report.timestamp = hrt_absolute_time();
-
-	// Example: <48,0.91,49.7,3968,2921,0,2,4,0,RECONDITION NEEDED,68>
-	int parsed = sscanf(local_buf,
-		"<%f,%f,%f,%f,%f,%ld,%f,%ld,%ld,%31[^,],%ld>",
-		&report.tank_pressure,        // float  -> %f
-		&report.regulated_pressure,   // float  -> %f
-		&report.battery_voltage,      // float  -> %f
-		&report.output_power,         // float  -> %f
-		&report.spm_power_draw,       // float  -> %f
-		&report.unit_in_fault,        // int32_t-> %ld
-		&report.battery_output_power, // float  -> %f
-		&report.psu_state,            // int32_t-> %ld
-		&report.main_error_code,      // int32_t-> %ld
-		report.info_string,           // char[32] -> %31[^,]
-		&report.checksum              // int32_t-> %ld
-	);
-
-	if (parsed == 11) {
-		_last_read_time = report.timestamp;
-		_fuel_cell_pub.publish(report);
-
-		PX4_INFO("Parsed OK: tank=%.2f, regulated=%.2f, info=%s, checksum=%ld",
-		         (double)report.tank_pressure,
-		         (double)report.regulated_pressure,
-		         report.info_string,
-		         report.checksum);
-
-	} else {
-		_parse_errors++;
-		PX4_WARN("Failed to parse data (parsed %d fields)", parsed);
-	}
 }
 
 void IE_1K2::Run()
 {
-	if (should_exit()) {
-		ScheduleClear();
-		exit_and_cleanup();
-		return;
-	}
+	PX4_INFO("IE_1K2::Run()");
+    // Ensure the serial port is open
+    if (_uart_fd < 0) {
+        if (open_serial_port(B9600) != PX4_OK) {
+            return;
+        }
+    }
 
-	perf_begin(_loop_perf);
-	perf_count(_loop_interval_perf);
-	// --- Debug print to confirm Run() is firing ---
-	PX4_INFO("IE_1K2::Run() called. Reading from UART...");
-	PX4_INFO_RAW("IE_1K2::Run() called. Reading from UART...\n");
+    // Perform collection
+    collect();
 
-	if (_uart_fd < 0) {
-		PX4_WARN("UART not open in Run()");
-		return;
-	}
-
-	static enum class ParseMode {
-		NONE,
-		ANGLE,
-		BRACKET
-	} parse_mode = ParseMode::ANGLE;
-
-	static uint8_t angle_buffer[RECEIVE_BUFFER_SIZE];
-	static size_t angle_length = 0;
-
-	static uint8_t bracket_buffer[RECEIVE_BUFFER_SIZE];
-	static size_t bracket_length = 0;
-
-	uint8_t byte;
-	uint8_t read_count = 0;
-	while (::read(_uart_fd, &byte, 1) > 0 && read_count < RECEIVE_BUFFER_SIZE) {
-		read_count++;
-	while (::read(_uart_fd, &byte, 1) > 0) {
-
-		switch (parse_mode) {
-
-		case ParseMode::NONE: {
-			if (byte == '<') {
-				parse_mode = ParseMode::ANGLE;
-				angle_length = 0;
-				angle_buffer[angle_length++] = byte;
-
-			} else if (byte == '[') {
-				parse_mode = ParseMode::BRACKET;
-				bracket_length = 0;
-				bracket_buffer[bracket_length++] = byte;
-			}
-		} break;
-
-		case ParseMode::ANGLE: {
-			if (angle_length < RECEIVE_BUFFER_SIZE) {
-				angle_buffer[angle_length++] = byte;
-
-				if (byte == '>') {
-					parse_mode = ParseMode::NONE;
-					angle_buffer[angle_length] = '\0';
-					PX4_INFO("End-of-angle-bracket message: length=%zu", angle_length);
-
-					processData(angle_buffer, angle_length);
-					angle_length = 0;
-				}
-
-			} else {
-				PX4_WARN("Angle buffer overflow. Clearing buffer.");
-				_rx_errors++;
-				parse_mode = ParseMode::NONE;
-				angle_length = 0;
-			}
-		} break;
-
-		case ParseMode::BRACKET: {
-			if (bracket_length < RECEIVE_BUFFER_SIZE) {
-				bracket_buffer[bracket_length++] = byte;
-
-				if (byte == ']') {
-					parse_mode = ParseMode::NONE;
-					bracket_buffer[bracket_length] = '\0';
-					PX4_INFO("Bracket line: %s", bracket_buffer);
-					bracket_length = 0;
-				}
-
-			} else {
-				PX4_WARN("Bracket buffer overflow. Clearing buffer.");
-				_rx_errors++;
-				parse_mode = ParseMode::NONE;
-				bracket_length = 0;
-			}
-		} break;
-		}
-	}
-
-	// If no data received for 1 second, print a warning
-	if (hrt_elapsed_time(&_last_read_time) > 100000) {
-		PX4_WARN("No data received for over 10");
-	}
-
-	perf_end(_loop_perf);
+    // Check for data timeout
+    if (hrt_elapsed_time(&_last_read_time) > 1000000) { // 1 second
+        PX4_WARN("No data received for over 1 second");
+    }
 }
 
-int IE_1K2::print_status()
+void IE_1K2::print_info()
 {
-	IE_1K2 *instance = _object.load();
+    PX4_INFO("Device port: %s", _port);
+    perf_print_counter(_sample_perf);
+    perf_print_counter(_comms_errors);
+    perf_print_counter(_parse_errors);
+}
 
-	if (instance == nullptr) {
-		PX4_INFO("Driver not running (_object is null)");
-	} else {
-		PX4_INFO("Driver running (instance at %p)", (void *)instance);
-		PX4_INFO("rx_errors: %" PRIu32 ", parse_errors: %" PRIu32,
-		         _rx_errors, _parse_errors);
-	}
-	perf_print_counter(_loop_perf);
-	perf_print_counter(_loop_interval_perf);
-	return 0;
+int IE_1K2::task_spawn(int argc, char *argv[])
+{
+    PX4_INFO("IE_1K2::task_spawn() - start");
+
+    // Default to ttyS3
+    const char *port = "/dev/ttyS3";
+    PX4_INFO("Port set to: %s", port);
+
+    // Check if port specified
+    int myoptind = 1;
+    int ch;
+    const char *myoptarg = nullptr;
+
+    PX4_INFO("Parsing arguments...");
+    while ((ch = px4_getopt(argc, argv, "d:", &myoptind, &myoptarg)) != EOF) {
+        switch (ch) {
+            case 'd':
+                port = myoptarg;
+                PX4_INFO("New port specified: %s", port);
+                break;
+        }
+    }
+
+    PX4_INFO("Creating instance...");
+    IE_1K2 *instance = new IE_1K2(port);
+
+    if (instance == nullptr) {
+        PX4_ERR("Allocation failed");
+        return PX4_ERROR;
+    }
+
+    PX4_INFO("Initializing instance...");
+    if (instance->init() != PX4_OK) {
+        PX4_ERR("Instance initialization failed");
+        delete instance;
+        return PX4_ERROR;
+    }
+
+    PX4_INFO("Storing instance...");
+    _object.store(instance);
+    _task_id = task_id_is_work_queue;
+
+    PX4_INFO("Task spawn completed successfully");
+    return PX4_OK;
+}
+
+IE_1K2 *IE_1K2::instantiate(int argc, char *argv[])
+{
+	PX4_INFO("IE_1K2::instantiate()");
+    // Default to ttyS1
+    const char *port = "/dev/ttyS3";
+
+    // Check if port specified
+    int myoptind = 1;
+    int ch;
+    const char *myoptarg = nullptr;
+
+    while ((ch = px4_getopt(argc, argv, "d:", &myoptind, &myoptarg)) != EOF) {
+        switch (ch) {
+            case 'd':
+                port = myoptarg;
+                break;
+        }
+    }
+
+    return new IE_1K2(port);
 }
 
 int IE_1K2::custom_command(int argc, char *argv[])
 {
-    if (argc > 1 && strcmp(argv[1], "run") == 0) {
-        PX4_INFO("Manual run command received, invoking Run() method");
-        IE_1K2 *inst = _object.load();
-        if (inst) {
-            inst->Run();
-            return PX4_OK;
-        } else {
-            PX4_ERR("Module instance not running");
-            return PX4_ERROR;
-        }
-    }
-    return print_usage("unknown command");
+    return print_usage("Unknown command");
 }
 
-
-
-
-int IE_1K2::task_spawn(int argc, char *argv[])
+int IE_1K2::print_usage(const char *reason)
 {
-	IE_1K2 *instance = new IE_1K2();
-	if (!instance) {
-		PX4_ERR("Allocation failed");
-		return PX4_ERROR;
-	}
-	else {
-		_object.store(instance);
-		_task_id = task_id_is_work_queue;
+    if (reason) {
+        PX4_WARN("%s\n", reason);
+    }
 
-		if (instance->init()) {
-			PX4_INFO("Driver IO");
-			return PX4_OK;
-		}
-	}
+    PRINT_MODULE_DESCRIPTION(R"DESCR_STR(
+### Description
+Driver for the IE_1K2 Fuel Cell power system.
 
-	delete instance;
-	_object.store(nullptr);
-	_task_id = -1;
+### Examples
+It is typically started with:
+$ ie_1k2 start -d /dev/ttyS1
+)DESCR_STR");
 
-	return PX4_ERROR;
+    PRINT_MODULE_USAGE_NAME("ie_1k2", "driver");
+    PRINT_MODULE_USAGE_COMMAND("start");
+    PRINT_MODULE_USAGE_PARAM_STRING('d', "/dev/ttyS1", "<file:dev>", "Serial port", true);
+    PRINT_MODULE_USAGE_COMMAND("stop");
+    PRINT_MODULE_USAGE_COMMAND("status");
+
+    return 0;
 }
 
 extern "C" __EXPORT int ie_1k2_main(int argc, char *argv[])
 {
-	return IE_1K2::main(argc, argv);
+    return IE_1K2::main(argc, argv);
 }
-
