@@ -40,8 +40,17 @@ protected:
 	void Run() override;
 
 private:
+	/**
+	 * Configure UART settings (baud, parity, etc.)
+	 * @return true on success, false on failure
+	 */
 	bool configureUart();
-	void processData();
+
+	/**
+	 * Process a single angle‐bracketed message. We pass in the data buffer
+	 * (already accumulated) plus its length.
+	 */
+	void processData(const uint8_t *buffer, size_t length);
 
 	// UART file descriptor and port string
 	int _uart_fd{-1};
@@ -50,14 +59,13 @@ private:
 	// uORB publication for fuel cell data
 	uORB::Publication<ie_fuel_cell_s> _fuel_cell_pub{ORB_ID(ie_fuel_cell)};
 
-	// Reception buffer (assuming a message fits within 256 bytes)
-	static constexpr size_t RECEIVE_BUFFER_SIZE = 256;
-	uint8_t _receive_buffer[RECEIVE_BUFFER_SIZE]{};
-	size_t _receive_length{0};
-
+	// Track whether we've initialized successfully
 	bool _initialized{false};
+
+	// Track the last time we received valid data
 	hrt_abstime _last_read_time{0};
 
+	// Counters for errors
 	uint32_t _rx_errors{0};
 	uint32_t _parse_errors{0};
 
